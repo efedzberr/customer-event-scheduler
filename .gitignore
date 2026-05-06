@@ -1,0 +1,11 @@
+.env
+.env.local
+*.key
+*.pem
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
