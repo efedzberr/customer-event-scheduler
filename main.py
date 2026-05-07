@@ -182,6 +182,12 @@ def availability(token: str = Query(...)):
     if not SF_ID_PATTERN.match(executive_id):
         raise HTTPException(400, "Invalid executive ID in token")
 
+    # Reject the token early if it was already used to book a meeting.
+    # This prevents the client from seeing the slot picker after they've
+    # already confirmed once with this same link.
+    if check_token_used(payload["jti"]):
+        raise HTTPException(status_code=409, detail="Este link ya fue usado")
+
     # Parse proposedStart into a TZ-aware datetime so we can include its day
     # in the availability response even if it's beyond DAYS_AHEAD.
     proposed_start_str = payload.get("proposedStart")
@@ -486,6 +492,28 @@ def calculate_free_slots(events, now, proposed_start_dt=None):
             })
 
     return days_output
+
+
+def check_token_used(jti):
+    """Returns True if the jti is already in tokens_usados (token spent).
+    Used by /availability to reject reuse of an already-confirmed link.
+    On any Supabase error, returns False (best-effort) — /book has the
+    authoritative check via the unique-jti constraint."""
+    try:
+        response = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/tokens_usados",
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            },
+            params={"jti": f"eq.{jti}", "select": "jti"},
+            timeout=5.0,
+        )
+        if response.status_code == 200:
+            return len(response.json()) > 0
+    except Exception:
+        pass
+    return False
 
 
 def parse_sf_datetime(dt_str):
