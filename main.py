@@ -157,7 +157,12 @@ def generate_token(req: GenerateTokenRequest, authorization: str = Header(None))
     }
 
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    link = f"{APP_BASE_URL}/agendar?token={token}"
+    # Use hash fragment (#token=) instead of query string (?token=) because
+    # bolt.host hosting returns a generic JSON error for non-root paths with
+    # query strings. Hash fragments are client-side only — the server sees
+    # path "/" and serves index.html, then the React app reads the token
+    # from window.location.hash.
+    link = f"{APP_BASE_URL}/#token={token}"
 
     return GenerateTokenResponse(token=token, link=link, jti=jti)
 
