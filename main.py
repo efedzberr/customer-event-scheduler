@@ -47,14 +47,49 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 # === Business rules ===
 
 TZ = ZoneInfo("America/Mexico_City")
-WORK_START_HOUR = 8
-WORK_START_MINUTE = 30
-WORK_END_HOUR = 17  # last slot starts at 16:30, ends at 17:30
 DAYS_AHEAD = 7
-SLOT_DURATION_HOURS = 1
 TOKEN_TTL_DAYS = 7
 
+# Slot definitions: (hour, minute, duration_minutes)
+# All slots are 1 hour. Workday runs from 8:30 AM to 6:30 PM (last slot
+# starts at 5:30 PM and ends at 6:30 PM).
+SLOT_DEFINITIONS = [
+    (8, 30, 60),    # 8:30 AM
+    (9, 30, 60),    # 9:30 AM
+    (10, 30, 60),   # 10:30 AM
+    (11, 30, 60),   # 11:30 AM
+    (12, 30, 60),   # 12:30 PM
+    (13, 30, 60),   # 1:30 PM
+    (14, 30, 60),   # 2:30 PM
+    (15, 30, 60),   # 3:30 PM
+    (16, 30, 60),   # 4:30 PM
+    (17, 30, 60),   # 5:30 PM (ends at 6:30 PM)
+]
+
+
+def get_slot_duration_minutes(dt):
+    """Returns the duration in minutes for a slot starting at the given datetime."""
+    for hour, minute, duration in SLOT_DEFINITIONS:
+        if dt.hour == hour and dt.minute == minute:
+            return duration
+    return 60
+
 SF_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{15,18}$")
+
+# Spanish day/month names — we format dates server-side to avoid timezone
+# parsing bugs in the browser (`new Date("2026-05-11")` is parsed as UTC
+# midnight and shifts a day backward in negative-UTC timezones).
+SPANISH_WEEKDAYS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+SPANISH_MONTHS = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def format_spanish_day(day):
+    """Returns 'Lunes, 11 de mayo'."""
+    return f"{SPANISH_WEEKDAYS[day.weekday()]}, {day.day} de {SPANISH_MONTHS[day.month - 1]}"
+
 
 # === FastAPI app ===
 
@@ -129,7 +164,8 @@ def generate_token(req: GenerateTokenRequest, authorization: str = Header(None))
 
 @app.get("/availability")
 def availability(token: str = Query(...)):
-    """Returns the executive's free 1-hour slots for the next 7 days."""
+    """Returns the executive's free 1-hour slots for the next 7 weekdays,
+    plus the proposedStart's day if it falls beyond that window."""
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
@@ -141,13 +177,29 @@ def availability(token: str = Query(...)):
     if not SF_ID_PATTERN.match(executive_id):
         raise HTTPException(400, "Invalid executive ID in token")
 
+    # Parse proposedStart into a TZ-aware datetime so we can include its day
+    # in the availability response even if it's beyond DAYS_AHEAD.
+    proposed_start_str = payload.get("proposedStart")
+    proposed_start_dt = None
+    if proposed_start_str:
+        try:
+            proposed_start_dt = datetime.fromisoformat(proposed_start_str).astimezone(TZ)
+        except (ValueError, TypeError):
+            proposed_start_dt = None
+
     access_token, instance_url = authenticate_salesforce()
 
     now = datetime.now(tz=TZ)
     end = now + timedelta(days=DAYS_AHEAD)
+
+    # If the proposed date is beyond the default end, extend the events query
+    # so we can correctly check conflicts on that day.
+    if proposed_start_dt and proposed_start_dt + timedelta(days=1) > end:
+        end = proposed_start_dt + timedelta(days=1)
+
     events = query_executive_events(access_token, instance_url, executive_id, now, end)
 
-    days = calculate_free_slots(events, now)
+    days = calculate_free_slots(events, now, proposed_start_dt)
 
     return {
         "executive": {"id": payload["executiveId"], "name": payload["executiveName"]},
@@ -194,7 +246,7 @@ def book(req: BookRequest, authorization: str = Header(None)):
     except ValueError:
         return {"status": "error", "code": "INVALID_DATETIME", "message": "Formato de fecha inválido"}
 
-    selected_end = selected_dt + timedelta(hours=SLOT_DURATION_HOURS)
+    selected_end = selected_dt + timedelta(minutes=get_slot_duration_minutes(selected_dt))
 
     # 2. Authenticate to Salesforce
     try:
@@ -365,33 +417,48 @@ def query_executive_events(access_token, instance_url, executive_id, start_dt, e
 
 # === Slot calculation ===
 
-def calculate_free_slots(events, now):
-    """1-hour slots between work hours, weekdays only, that don't conflict with `events`."""
-    days_output = []
+def calculate_free_slots(events, now, proposed_start_dt=None):
+    """
+    Generates slots from SLOT_DEFINITIONS for each weekday in the next DAYS_AHEAD.
+    Returns only AVAILABLE slots (filters out past slots and conflicting ones).
+    Days with zero available slots are omitted.
 
+    If `proposed_start_dt` falls beyond the default 7-day window AND it's a
+    weekday, that day is also included.
+    """
+    days_to_consider = []
     for d in range(DAYS_AHEAD):
         day = (now + timedelta(days=d)).date()
+        if day.weekday() < 5:  # Mon=0 .. Fri=4
+            days_to_consider.append(day)
 
-        if day.weekday() >= 5:  # Saturday=5, Sunday=6
-            continue
+    if proposed_start_dt:
+        proposed_day = proposed_start_dt.date()
+        if proposed_day.weekday() < 5 and proposed_day not in days_to_consider:
+            days_to_consider.append(proposed_day)
 
+    days_to_consider.sort()
+
+    days_output = []
+    for day in days_to_consider:
         slots = []
-        slot_count = WORK_END_HOUR - WORK_START_HOUR  # 9 slots: 8:30 .. 16:30
 
-        for i in range(slot_count):
+        for slot_hour, slot_minute, duration_min in SLOT_DEFINITIONS:
             slot_start = datetime(
                 year=day.year,
                 month=day.month,
                 day=day.day,
-                hour=WORK_START_HOUR + i,
-                minute=WORK_START_MINUTE,
+                hour=slot_hour,
+                minute=slot_minute,
                 tzinfo=TZ,
             )
-            slot_end = slot_start + timedelta(hours=SLOT_DURATION_HOURS)
+            slot_end = slot_start + timedelta(minutes=duration_min)
 
+            # Skip past slots.
             if slot_start < now:
                 continue
 
+            # Skip conflicting slots.
             conflicts = False
             for ev in events:
                 ev_start = parse_sf_datetime(ev["StartDateTime"])
@@ -409,6 +476,7 @@ def calculate_free_slots(events, now):
         if slots:
             days_output.append({
                 "date": day.isoformat(),
+                "label": format_spanish_day(day),
                 "slots": slots,
             })
 
