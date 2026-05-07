@@ -122,7 +122,7 @@ def generate_token(req: GenerateTokenRequest, authorization: str = Header(None))
     }
 
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    link = f"{APP_BASE_URL}/#token={token}"
+    link = f"{APP_BASE_URL}/agendar?token={token}"
 
     return GenerateTokenResponse(token=token, link=link, jti=jti)
 
