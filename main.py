@@ -188,13 +188,19 @@ def availability(token: str = Query(...)):
     if check_token_used(payload["jti"]):
         raise HTTPException(status_code=409, detail="Este link ya fue usado")
 
-    # Parse proposedStart into a TZ-aware datetime so we can include its day
-    # in the availability response even if it's beyond DAYS_AHEAD.
+    # Parse proposedStart into a TZ-aware datetime. We use parse_sf_datetime
+    # because Salesforce serializes DateTime values as e.g. "2026-05-22T17:30:00.000+0000"
+    # or "...Z" — both forms are handled by that helper.
     proposed_start_str = payload.get("proposedStart")
     proposed_start_dt = None
+    proposed_start_normalized = proposed_start_str  # fallback if parsing fails
     if proposed_start_str:
         try:
-            proposed_start_dt = datetime.fromisoformat(proposed_start_str).astimezone(TZ)
+            proposed_start_dt = parse_sf_datetime(proposed_start_str)
+            # Normalize to Mexico TZ ISO format so the frontend's string
+            # comparison against slot.datetime works regardless of the
+            # original timezone in the JWT.
+            proposed_start_normalized = proposed_start_dt.isoformat()
         except (ValueError, TypeError):
             proposed_start_dt = None
 
@@ -215,7 +221,7 @@ def availability(token: str = Query(...)):
     return {
         "executive": {"id": payload["executiveId"], "name": payload["executiveName"]},
         "client": {"id": payload["clientId"], "name": payload["clientName"]},
-        "proposedStart": payload["proposedStart"],
+        "proposedStart": proposed_start_normalized,
         "days": days,
     }
 
