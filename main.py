@@ -47,32 +47,16 @@ SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 # === Business rules ===
 
 TZ = ZoneInfo("America/Mexico_City")
-DAYS_AHEAD = 7
+WEEKDAYS_TO_SHOW = 5         # number of business days (Mon-Fri) shown to the client
 TOKEN_TTL_DAYS = 7
 
-# Slot definitions: (hour, minute, duration_minutes)
-# All slots are 1 hour. Workday runs from 8:30 AM to 6:30 PM (last slot
-# starts at 5:30 PM and ends at 6:30 PM).
-SLOT_DEFINITIONS = [
-    (8, 30, 60),    # 8:30 AM
-    (9, 30, 60),    # 9:30 AM
-    (10, 30, 60),   # 10:30 AM
-    (11, 30, 60),   # 11:30 AM
-    (12, 30, 60),   # 12:30 PM
-    (13, 30, 60),   # 1:30 PM
-    (14, 30, 60),   # 2:30 PM
-    (15, 30, 60),   # 3:30 PM
-    (16, 30, 60),   # 4:30 PM
-    (17, 30, 60),   # 5:30 PM (ends at 6:30 PM)
-]
-
-
-def get_slot_duration_minutes(dt):
-    """Returns the duration in minutes for a slot starting at the given datetime."""
-    for hour, minute, duration in SLOT_DEFINITIONS:
-        if dt.hour == hour and dt.minute == minute:
-            return duration
-    return 60
+# Working hours that bound slot generation. Slots are spaced 1 hour apart.
+# Whether they start on the hour (8:00, 9:00, ...) or on the half (8:30, 9:30, ...)
+# is decided dynamically per-link from the executive's proposedStart minute.
+WORK_START_HOUR = 8           # earliest slot can start at 8:00 or 8:30
+WORK_END_HOUR = 18            # latest slot must END at or before 18:30
+                              # (so latest start is 17:30 if duration is 60 min)
+SLOT_DURATION_MINUTES = 60
 
 SF_ID_PATTERN = re.compile(r"^[a-zA-Z0-9]{15,18}$")
 
@@ -207,14 +191,18 @@ def availability(token: str = Query(...)):
     access_token, instance_url = authenticate_salesforce()
 
     now = datetime.now(tz=TZ)
-    end = now + timedelta(days=DAYS_AHEAD)
 
-    # If the proposed date is beyond the default end, extend the events query
-    # so we can correctly check conflicts on that day.
-    if proposed_start_dt and proposed_start_dt + timedelta(days=1) > end:
-        end = proposed_start_dt + timedelta(days=1)
+    # Build the events query window so it covers all the weekdays we'll show.
+    # Worst case: proposed day is a Monday → Mon..Fri = 5 calendar days.
+    # Best case: proposed day is a Friday → Fri + Mon..Thu next week = 7 days.
+    # We pad with a small buffer to be safe.
+    query_start = now
+    if proposed_start_dt and proposed_start_dt < now:
+        query_start = proposed_start_dt  # defensive, shouldn't happen
+    query_end_anchor = proposed_start_dt if proposed_start_dt else now
+    query_end = query_end_anchor + timedelta(days=10)
 
-    events = query_executive_events(access_token, instance_url, executive_id, now, end)
+    events = query_executive_events(access_token, instance_url, executive_id, query_start, query_end)
 
     days = calculate_free_slots(events, now, proposed_start_dt)
 
@@ -263,7 +251,7 @@ def book(req: BookRequest, authorization: str = Header(None)):
     except ValueError:
         return {"status": "error", "code": "INVALID_DATETIME", "message": "Formato de fecha inválido"}
 
-    selected_end = selected_dt + timedelta(minutes=get_slot_duration_minutes(selected_dt))
+    selected_end = selected_dt + timedelta(minutes=SLOT_DURATION_MINUTES)
 
     # 2. Authenticate to Salesforce
     try:
@@ -436,40 +424,70 @@ def query_executive_events(access_token, instance_url, executive_id, start_dt, e
 
 def calculate_free_slots(events, now, proposed_start_dt=None):
     """
-    Generates slots from SLOT_DEFINITIONS for each weekday in the next DAYS_AHEAD.
+    Generates 1-hour slots for WEEKDAYS_TO_SHOW (5) business days starting
+    from `proposed_start_dt`'s date forward. Weekends are skipped: if a Sat/Sun
+    falls inside the window, we keep walking forward into the next week until
+    we have 5 business days.
+
+    Slot minute alignment is determined by `proposed_start_dt.minute`:
+      - if 0  → slots at  8:00, 9:00, 10:00, ... 17:00  (10 slots)
+      - if 30 → slots at  8:30, 9:30, 10:30, ... 17:30  (10 slots)
+      - other minutes are normalized to the closest of the two.
+
     Returns only AVAILABLE slots (filters out past slots and conflicting ones).
-    Days with zero available slots are omitted.
-
-    If `proposed_start_dt` falls beyond the default 7-day window AND it's a
-    weekday, that day is also included.
+    Days with zero available slots are still returned (so the day always shows
+    up in the UI), but with an empty `slots` array.
     """
-    days_to_consider = []
-    for d in range(DAYS_AHEAD):
-        day = (now + timedelta(days=d)).date()
-        if day.weekday() < 5:  # Mon=0 .. Fri=4
-            days_to_consider.append(day)
-
+    # Decide where to start. If no proposedStart, fall back to "today".
     if proposed_start_dt:
-        proposed_day = proposed_start_dt.date()
-        if proposed_day.weekday() < 5 and proposed_day not in days_to_consider:
-            days_to_consider.append(proposed_day)
+        start_day = proposed_start_dt.date()
+        # Determine slot minute from proposedStart. Round to nearest of {0, 30}.
+        slot_minute = 0 if proposed_start_dt.minute < 15 else (
+            30 if proposed_start_dt.minute < 45 else 0
+        )
+        # Note: if proposed minute is e.g. 45+, we round up to next hour at :00.
+        # Most calls use exact :00 or :30 so this is a defensive fallback.
+    else:
+        start_day = now.date()
+        slot_minute = 30  # default historical behavior
 
-    days_to_consider.sort()
+    # If proposedStart's date is in the past relative to "now", clamp to today.
+    # The user explicitly said "no hacia atrás" — never go backwards.
+    today = now.date()
+    if start_day < today:
+        start_day = today
+
+    # If start_day lands on a weekend, advance to the next Monday.
+    while start_day.weekday() >= 5:
+        start_day += timedelta(days=1)
+
+    # Walk forward collecting WEEKDAYS_TO_SHOW business days.
+    days_to_consider = []
+    current_day = start_day
+    while len(days_to_consider) < WEEKDAYS_TO_SHOW:
+        if current_day.weekday() < 5:  # Mon=0 .. Fri=4
+            days_to_consider.append(current_day)
+        current_day += timedelta(days=1)
+
+    # Build the hourly slot list once — same shape for every day.
+    slot_hours = list(range(WORK_START_HOUR, WORK_END_HOUR))  # e.g. [8..17]
+    # When minute is 30 the last slot starts at 17:30 and ends at 18:30,
+    # which is fine since WORK_END_HOUR = 18 means "must end by 18:30".
 
     days_output = []
     for day in days_to_consider:
         slots = []
 
-        for slot_hour, slot_minute, duration_min in SLOT_DEFINITIONS:
+        for hour in slot_hours:
             slot_start = datetime(
                 year=day.year,
                 month=day.month,
                 day=day.day,
-                hour=slot_hour,
+                hour=hour,
                 minute=slot_minute,
                 tzinfo=TZ,
             )
-            slot_end = slot_start + timedelta(minutes=duration_min)
+            slot_end = slot_start + timedelta(minutes=SLOT_DURATION_MINUTES)
 
             # Skip past slots.
             if slot_start < now:
@@ -490,12 +508,13 @@ def calculate_free_slots(events, now, proposed_start_dt=None):
                     "datetime": slot_start.isoformat(),
                 })
 
-        if slots:
-            days_output.append({
-                "date": day.isoformat(),
-                "label": format_spanish_day(day),
-                "slots": slots,
-            })
+        # Always include the day in the output, even if no slots — keeps UI
+        # consistent so the client sees the date header even if it's full.
+        days_output.append({
+            "date": day.isoformat(),
+            "label": format_spanish_day(day),
+            "slots": slots,
+        })
 
     return days_output
 
