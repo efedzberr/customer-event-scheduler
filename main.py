@@ -23,6 +23,7 @@ Environment variables (required):
 import os
 import re
 import uuid
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,14 @@ import jwt
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# === Logging ===
+# Logs go to stdout so they show up in Railway's "Deploy Logs".
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("event-scheduler")
 
 # === Configuration ===
 
@@ -73,6 +82,39 @@ SPANISH_MONTHS = [
 def format_spanish_day(day):
     """Returns 'Lunes, 11 de mayo'."""
     return f"{SPANISH_WEEKDAYS[day.weekday()]}, {day.day} de {SPANISH_MONTHS[day.month - 1]}"
+
+
+# === Startup diagnostics ===
+# Logged once when the app boots so we can confirm in Railway's Deploy Logs
+# that the environment variables point at the right Salesforce org. No secret
+# values are printed — only safe prefixes/lengths.
+
+def _log_startup_config():
+    """Logs a safe summary of the Salesforce-related config at boot time."""
+    pk = SF_PRIVATE_KEY or ""
+    pk_has_begin = "BEGIN" in pk
+    pk_has_end = "END" in pk
+    pk_has_real_newlines = "\n" in pk
+    pk_has_escaped_newlines = "\\n" in pk
+    logger.info("=== STARTUP CONFIG (Salesforce) ===")
+    logger.info("SF_LOGIN_URL = %r", SF_LOGIN_URL)
+    logger.info("SF_USERNAME  = %r", SF_USERNAME)
+    logger.info("SF_CLIENT_ID length = %d, prefix = %r",
+                len(SF_CLIENT_ID or ""), (SF_CLIENT_ID or "")[:10])
+    logger.info(
+        "SF_PRIVATE_KEY length = %d | has BEGIN = %s | has END = %s | "
+        "real newlines = %s | escaped \\n = %s",
+        len(pk), pk_has_begin, pk_has_end, pk_has_real_newlines, pk_has_escaped_newlines,
+    )
+    if pk_has_escaped_newlines and not pk_has_real_newlines:
+        logger.warning(
+            "SF_PRIVATE_KEY appears to contain literal \\n instead of real "
+            "line breaks. This will likely break RS256 signing."
+        )
+    logger.info("===================================")
+
+
+_log_startup_config()
 
 
 # === FastAPI app ===
@@ -334,6 +376,8 @@ def book(req: BookRequest, authorization: str = Header(None)):
     if sf_response.status_code not in (200, 201):
         # Note: Supabase row remains as "spent" — token won't work again.
         # Acceptable: better to require a new link than risk creating duplicate events.
+        logger.error("Event creation failed: status=%s body=%s",
+                      sf_response.status_code, sf_response.text[:500])
         return {
             "status": "error",
             "code": "INTERNAL",
@@ -367,7 +411,11 @@ def book(req: BookRequest, authorization: str = Header(None)):
 # === Salesforce JWT Bearer Flow ===
 
 def authenticate_salesforce():
-    """Authenticates to Salesforce via JWT Bearer Flow. Returns (access_token, instance_url)."""
+    """Authenticates to Salesforce via JWT Bearer Flow. Returns (access_token, instance_url).
+
+    Detailed diagnostics are logged to stdout (Railway "Deploy Logs") so that
+    any auth failure shows the exact error returned by Salesforce.
+    """
     now = datetime.now(tz=ZoneInfo("UTC"))
     claims = {
         "iss": SF_CLIENT_ID,
@@ -376,21 +424,56 @@ def authenticate_salesforce():
         "exp": int((now + timedelta(minutes=3)).timestamp()),
     }
 
-    assertion = jwt.encode(claims, SF_PRIVATE_KEY, algorithm="RS256")
-
-    response = httpx.post(
-        f"{SF_LOGIN_URL}/services/oauth2/token",
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": assertion,
-        },
-        timeout=10.0,
+    logger.info(
+        "[SF AUTH] starting JWT Bearer flow | aud=%r sub=%r iss_prefix=%r",
+        SF_LOGIN_URL, SF_USERNAME, (SF_CLIENT_ID or "")[:10],
     )
 
+    # Build the signed assertion. If the private key is malformed (bad pasting
+    # in Railway, wrong format, etc.) this raises before any network call.
+    try:
+        assertion = jwt.encode(claims, SF_PRIVATE_KEY, algorithm="RS256")
+    except Exception as e:
+        logger.error(
+            "[SF AUTH] could not sign the JWT assertion. This usually means "
+            "SF_PRIVATE_KEY is malformed (missing BEGIN/END lines, literal \\n "
+            "instead of real line breaks, or not an RSA key). Error: %s",
+            repr(e),
+        )
+        raise HTTPException(502, f"Salesforce auth failed: cannot sign assertion ({e})")
+
+    token_url = f"{SF_LOGIN_URL}/services/oauth2/token"
+    try:
+        response = httpx.post(
+            token_url,
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": assertion,
+            },
+            timeout=10.0,
+        )
+    except Exception as e:
+        # Network-level failure: DNS, TLS, connection refused, timeout, etc.
+        logger.error("[SF AUTH] network error calling %s : %s", token_url, repr(e))
+        raise HTTPException(502, f"Salesforce auth failed: network error ({e})")
+
     if response.status_code != 200:
+        # This is the important one: Salesforce reached us back but REJECTED
+        # the authentication. The body explains exactly why (invalid_grant,
+        # invalid_client, etc). We log it in full so it shows up in Railway.
+        logger.error(
+            "[SF AUTH] REJECTED by Salesforce | status=%s | body=%s",
+            response.status_code, response.text,
+        )
+        logger.error(
+            "[SF AUTH] context for the rejection above -> "
+            "login_url=%r username=%r client_id_prefix=%r",
+            SF_LOGIN_URL, SF_USERNAME, (SF_CLIENT_ID or "")[:10],
+        )
         raise HTTPException(502, f"Salesforce auth failed: {response.text}")
 
     data = response.json()
+    logger.info("[SF AUTH] success | instance_url=%s", data.get("instance_url"))
     return data["access_token"], data["instance_url"]
 
 
@@ -415,6 +498,10 @@ def query_executive_events(access_token, instance_url, executive_id, start_dt, e
     )
 
     if response.status_code != 200:
+        logger.error(
+            "[SF QUERY] failed | status=%s | body=%s",
+            response.status_code, response.text,
+        )
         raise HTTPException(502, f"Salesforce query failed: {response.text}")
 
     return response.json()["records"]
