@@ -362,6 +362,7 @@ def book(req: BookRequest, authorization: str = Header(None)):
         "Description": "Junta agendada por el cliente vía link de auto-agenda.",
         "IsAllDayEvent": False,
         "Creado_con_IA__c": True,
+        "Invitar_Cliente__c": True,
     }
 
     sf_response = httpx.post(
